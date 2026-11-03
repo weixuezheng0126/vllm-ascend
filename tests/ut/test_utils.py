@@ -13,6 +13,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import builtins
 import json
 import math
 import os
@@ -27,7 +28,54 @@ from tests.ut.base import TestBase
 from vllm_ascend import utils
 from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.device.hardware_profile import get_hardware_profile
-from vllm_ascend.utils import REGISTERED_ASCEND_OPS
+
+
+@pytest.mark.parametrize("device_type", list(AscendDeviceType))
+def test_register_customop_selects_gdn_before_import(device_type):
+    from vllm_ascend._310p.ops.fla.gdn_310 import AscendGatedDeltaNetAttention310
+
+    if device_type == AscendDeviceType._310P:
+        expected_gdn = AscendGatedDeltaNetAttention310
+    else:
+        from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
+
+        expected_gdn = AscendGatedDeltaNetAttention
+
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if device_type == AscendDeviceType._310P and (
+            name == "vllm_ascend.ops.gdn" or name == "fla_npu" or name.startswith("fla_npu.")
+        ):
+            raise ModuleNotFoundError(f"Unexpected 310P dependency: {name}", name=name)
+        return original_import(name, *args, **kwargs)
+
+    with (
+        mock.patch.object(utils, "_ASCEND_CUSTOMOP_IS_REIGISTERED", False),
+        mock.patch.object(utils, "REGISTERED_ASCEND_OPS", {}),
+        mock.patch.object(utils, "get_current_hardware_profile", return_value=get_hardware_profile(device_type)),
+        mock.patch("vllm.model_executor.custom_op.CustomOp.register_oot") as register,
+        mock.patch("builtins.__import__", side_effect=guarded_import),
+    ):
+        utils.register_ascend_customop()
+        assert utils.REGISTERED_ASCEND_OPS["GatedDeltaNetAttention"] is expected_gdn
+        register.assert_any_call(_decorated_op_cls=expected_gdn, name="GatedDeltaNetAttention")
+        assert register.call_count == len(utils.REGISTERED_ASCEND_OPS)
+        utils.register_ascend_customop()
+        assert register.call_count == len(utils.REGISTERED_ASCEND_OPS)
+
+
+def test_cp_decode_stream_is_cached_and_separate_from_chunked_prefill():
+    decode_stream, prefill_stream = object(), object()
+    with (
+        mock.patch.object(utils, "_CP_DECODE_COMM_STREAM", None),
+        mock.patch.object(utils, "_CP_CHUNKEDPREFILL_COMM_STREAM", None),
+        mock.patch.object(utils.torch_npu.npu, "Stream", side_effect=[decode_stream, prefill_stream]),
+    ):
+        assert utils.cp_decode_comm_stream() is decode_stream
+        assert utils.cp_decode_comm_stream() is decode_stream
+        assert utils.cp_chunkedprefill_comm_stream() is prefill_stream
+        assert utils.cp_chunkedprefill_comm_stream() is prefill_stream
 
 
 class TestUtils(TestBase):
@@ -37,8 +85,6 @@ class TestUtils(TestBase):
         from vllm_ascend import platform
 
         importlib.reload(platform)
-        utils.enable_dsa_cp.cache_clear()
-        utils.enable_dsa_cp_full_o_proj.cache_clear()
         utils.enable_pcp_o_proj_weight_sharding.cache_clear()
 
     def test_nd_to_nz_2d(self):
@@ -145,18 +191,6 @@ class TestUtils(TestBase):
             self.assertIs(utils.current_stream(), mock_stream)
             mock_current_stream.assert_called_once()
 
-    def test_enable_dsa_cp_full_o_proj_is_independent_of_pcp_switch(self):
-        mock_vllm_config = mock.MagicMock()
-        mock_vllm_config.kv_transfer_config = None
-
-        with (
-            mock.patch("vllm.config.get_current_vllm_config", return_value=mock_vllm_config),
-            mock.patch("vllm_ascend.utils.enable_dsa_cp", return_value=True),
-            mock.patch("vllm_ascend.utils.enable_pcp_o_proj_weight_sharding", return_value=False) as pcp_switch,
-        ):
-            self.assertTrue(utils.enable_dsa_cp_full_o_proj())
-        pcp_switch.assert_not_called()
-
     def test_enable_sp_uses_upstream_parallel_config(self):
         # Stop any leaked patch("vllm_ascend.utils.enable_sp") from other TestCases.
         mock.patch.stopall()
@@ -184,65 +218,22 @@ class TestUtils(TestBase):
         )
         self.assertFalse(utils.enable_sp(no_sequence_parallel_config))
 
-    def test_enable_dsa_cp_is_independent_from_moe_sequence_parallel(self):
-        ascend_config = SimpleNamespace(enable_dsa_cp=True)
+    def test_pad_sequence_parallel_tokens_pads_unconditionally(self):
+        with mock.patch("vllm.distributed.get_tensor_model_parallel_world_size", return_value=4):
+            padded = utils.pad_sequence_parallel_tokens(torch.zeros(6, 3))
+        self.assertEqual(padded.shape, (8, 3))
 
+        aligned = torch.zeros(8, 3)
         with (
-            mock.patch("vllm_ascend.ascend_config.get_ascend_config", return_value=ascend_config),
-            mock.patch("vllm_ascend.utils.enable_sp") as mock_enable_sp,
+            mock.patch("vllm.distributed.get_tensor_model_parallel_world_size", return_value=4),
+            mock.patch("torch.nn.functional.pad", wraps=torch.nn.functional.pad) as mock_pad,
         ):
-            self.assertTrue(utils.enable_dsa_cp())
+            padded = utils.pad_sequence_parallel_tokens(aligned)
 
-        mock_enable_sp.assert_not_called()
-
-    def test_enable_dsa_cp_reads_validated_ascend_config(self):
-        ascend_config = mock.MagicMock(enable_dsa_cp=False)
-
-        with (
-            mock.patch("vllm_ascend.ascend_config.get_ascend_config", return_value=ascend_config),
-            mock.patch("vllm_ascend.utils.enable_sp", return_value=True),
-        ):
-            self.assertFalse(utils.enable_dsa_cp())
-
-    def test_enable_dsa_cp_full_o_proj_accepts_kv_both(self):
-        mock_vllm_config = mock.MagicMock()
-        mock_vllm_config.kv_transfer_config = mock.MagicMock(
-            kv_role="kv_both", is_kv_producer=True, is_kv_consumer=True
-        )
-
-        with (
-            mock.patch("vllm.config.get_current_vllm_config", return_value=mock_vllm_config),
-            mock.patch("vllm_ascend.utils.enable_dsa_cp", return_value=True),
-        ):
-            self.assertTrue(utils.enable_dsa_cp_full_o_proj())
-
-    def test_enable_dsa_cp_full_o_proj_accepts_kv_producer(self):
-        mock_vllm_config = mock.MagicMock()
-        mock_vllm_config.kv_transfer_config = mock.MagicMock(
-            kv_role="kv_producer", is_kv_producer=True, is_kv_consumer=False
-        )
-
-        with (
-            mock.patch("vllm.config.get_current_vllm_config", return_value=mock_vllm_config),
-            mock.patch("vllm_ascend.utils.enable_dsa_cp", return_value=True),
-        ):
-            self.assertTrue(utils.enable_dsa_cp_full_o_proj())
-
-    def test_enable_dsa_cp_full_o_proj_rejects_kv_consumer(self):
-        mock_vllm_config = mock.MagicMock()
-        mock_vllm_config.kv_transfer_config = mock.MagicMock(
-            kv_role="kv_consumer", is_kv_producer=False, is_kv_consumer=True
-        )
-
-        with (
-            mock.patch("vllm.config.get_current_vllm_config", return_value=mock_vllm_config),
-            mock.patch("vllm_ascend.utils.enable_dsa_cp", return_value=True),
-        ):
-            self.assertFalse(utils.enable_dsa_cp_full_o_proj())
-
-    def test_enable_dsa_cp_full_o_proj_rejects_when_dsa_cp_disabled(self):
-        with mock.patch("vllm_ascend.utils.enable_dsa_cp", return_value=False):
-            self.assertFalse(utils.enable_dsa_cp_full_o_proj())
+        # An aligned tracing input must still record the pad, otherwise the
+        # replayed graph drops padding for non-aligned token counts.
+        mock_pad.assert_called_once_with(aligned, (0, 0, 0, 0))
+        self.assertEqual(padded.shape, (8, 3))
 
     def test_enable_pcp_o_proj_weight_sharding_reads_validated_ascend_config(self):
         ascend_config = SimpleNamespace(enable_pcp_o_proj_weight_sharding=True)
@@ -363,12 +354,12 @@ class TestUtils(TestBase):
 
         # ascend custom op is not registered
         utils.register_ascend_customop()
-        self.assertEqual(mock_customop.register_oot.call_count, len(REGISTERED_ASCEND_OPS))
+        self.assertEqual(mock_customop.register_oot.call_count, len(utils.REGISTERED_ASCEND_OPS))
         self.assertTrue(utils._ASCEND_CUSTOMOP_IS_REIGISTERED)
 
         # ascend custom op is already registered
         utils.register_ascend_customop()
-        self.assertEqual(mock_customop.register_oot.call_count, len(REGISTERED_ASCEND_OPS))
+        self.assertEqual(mock_customop.register_oot.call_count, len(utils.REGISTERED_ASCEND_OPS))
 
     @mock.patch("torch_npu.npu_format_cast")
     def test_maybe_trans_nz(self, mock_npu_format_cast):
@@ -705,6 +696,13 @@ def test_is_pd_decode_recompute_scheduler_enabled_decode_consumer_disabled():
         assert utils.is_pd_decode_recompute_scheduler_enabled(vllm_config) is False
 
 
+def test_should_reuse_topk_keeps_frequency_logic():
+    config = SimpleNamespace(index_topk_freq=4, index_skip_topk_offset=3)
+
+    assert not utils.should_reuse_topk(config, 2)
+    assert utils.should_reuse_topk(config, 3)
+
+
 def test_check_gdn_layer_supports_kimi_linear_config_property():
     from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
@@ -825,6 +823,41 @@ class TestIsRlWeightUpdateEnabled(TestBase):
             self.assertTrue(utils.is_rl_weight_update_enabled(self._vllm_config(SimpleNamespace(backend="npu_ipc"))))
 
 
+class TestRefreshBlockSizeC8MXFP(TestBase):
+    def _config(self, block_size, *, is_hybrid=False, user_specified=False):
+        return SimpleNamespace(
+            cache_config=SimpleNamespace(
+                block_size=block_size,
+                cache_dtype="mxfp8",
+                user_specified_block_size=user_specified,
+                mamba_page_size_padded=123456,
+                mamba_block_size=32768,
+            ),
+            model_config=SimpleNamespace(is_hybrid=is_hybrid),
+            scheduler_config=SimpleNamespace(),
+            speculative_config=None,
+        )
+
+    def test_default_block_size_becomes_kernel_size(self):
+        for hybrid in (False, True):
+            config = self._config(128, is_hybrid=hybrid)
+            utils.refresh_block_size(config)
+            self.assertEqual(config.cache_config.block_size, 512)
+
+    def test_scheduler_block_can_contain_multiple_kernel_blocks(self):
+        for size in (512, 1024, 4096):
+            config = self._config(size, is_hybrid=True, user_specified=True)
+            utils.refresh_block_size(config)
+            self.assertEqual(config.cache_config.block_size, size)
+            self.assertEqual(config.cache_config.mamba_page_size_padded, 123456)
+            self.assertEqual(config.cache_config.mamba_block_size, 32768)
+
+    def test_invalid_explicit_block_size_is_rejected(self):
+        config = self._config(768, user_specified=True)
+        with self.assertRaisesRegex(ValueError, "multiple of 512"):
+            utils.refresh_block_size(config)
+
+
 @pytest.fixture
 def physical_device_lookup():
     with mock.patch("vllm.platforms.current_platform") as platform:
@@ -872,3 +905,26 @@ def test_endpoint_mapping_failure_does_not_fall_back(tmp_path, monkeypatch, phys
 def test_no_endpoint_path_does_not_resolve_device(config, physical_device_lookup):
     utils.setup_ascend_local_comm_res(0, config)
     physical_device_lookup.assert_not_called()
+
+
+@pytest.mark.parametrize("size,enabled", [(0, False), (1, False), (2, True), (8, True)])
+def test_oproj_tp_enable_requires_weight_sharding(size, enabled):
+    config = SimpleNamespace(finegrained_tp_config=SimpleNamespace(oproj_tensor_parallel_size=size))
+    with mock.patch("vllm_ascend.utils.get_ascend_config", return_value=config):
+        assert utils.oproj_tp_enable() is enabled
+
+
+@pytest.mark.parametrize("size,enabled", [(0, False), (1, False), (2, True), (8, True)])
+@pytest.mark.parametrize(
+    "knob,enable_fn",
+    [
+        ("lmhead_tensor_parallel_size", "lmhead_tp_enable"),
+        ("embedding_tensor_parallel_size", "embedding_tp_enable"),
+        ("mlp_tensor_parallel_size", "mlp_tp_enable"),
+    ],
+)
+def test_finegrained_tp_enable_requires_weight_sharding(knob, enable_fn, size, enabled):
+    """All four knobs share one convention: 0 and 1 both mean disabled."""
+    config = SimpleNamespace(finegrained_tp_config=SimpleNamespace(**{knob: size}))
+    with mock.patch("vllm_ascend.utils.get_ascend_config", return_value=config):
+        assert getattr(utils, enable_fn)() is enabled

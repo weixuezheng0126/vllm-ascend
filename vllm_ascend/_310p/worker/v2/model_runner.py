@@ -54,7 +54,7 @@ from vllm_ascend._310p.worker.v2.spec_utils import (
 from vllm_ascend._310p.worker.v2.states import Ascend310PRequestState
 from vllm_ascend.core.kv_cache_interface import get_storage_block_size
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
-from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, get_kv_cache_tensor_layers
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, get_kv_cache_tensor_layers, shared_experts_calculation_stream
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 
@@ -153,6 +153,14 @@ class NPUModelRunner310V2(NPUModelRunner):
         self._attn_kv_copy_params: list[tuple[torch.Tensor, torch.Tensor, int]] = []
         self._attn_kv_storage_ptrs: set[int] = set()
 
+    def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
+        super().load_model(load_dummy_weights, *args, **kwargs)
+        if self.ascend_config.multistream_overlap_shared_expert:
+            # MRv2 profiles and captures after load_model. Allocate the shared
+            # stream here so its resources are accounted for before profiling
+            # and no lazy stream creation is needed inside ACL graph capture.
+            shared_experts_calculation_stream()
+
     def _make_metadata_buffer(
         self,
         size: int,
@@ -249,6 +257,15 @@ class NPUModelRunner310V2(NPUModelRunner):
             num_valid_tokens,
             kv_cache_config=self.kv_cache_config,
         )
+        # Shared build_attn_state (#17461) maps MTP verify → ChunkedPrefill.
+        # 310P FULL capture/replay still uses SpecDecoding (splitfuse); promote
+        # so InputBatch matches ACLGraph make_dummy and pad logic (MRv1 parity).
+        attn_state = self._promote_mtp_spec_decoding_attn_state(
+            attn_state,
+            num_reqs=num_reqs,
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_valid_tokens=num_valid_tokens,
+        )
         idx_mapping_np = self._idx_mapping.np[:num_reqs]
         idx_mapping_np[:] = np.fromiter(
             map(self.req_states.req_id_to_index.get, req_ids),
@@ -321,6 +338,13 @@ class NPUModelRunner310V2(NPUModelRunner):
         num_computed_prefill_tokens_np = self.req_states.num_computed_prefill_tokens[idx_mapping_np]
         is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
         batch_has_prefill = bool(np.any(is_prefilling_np))
+        prefill_runs_as_decode_np = None
+        decode_graph_eligible = not batch_has_prefill
+        if batch_has_prefill:
+            prefill_runs_as_decode_np = (
+                is_prefilling_np & (num_valid_tokens == 1) & (num_computed_prefill_tokens_np > 0)
+            )
+            decode_graph_eligible = bool((prefill_runs_as_decode_np | ~is_prefilling_np).all())
         self.eplb.set_batch_phase(batch_has_prefill)
         self._prepare_token_inputs_cpu(
             idx_mapping,
@@ -400,6 +424,8 @@ class NPUModelRunner310V2(NPUModelRunner):
             logits_indices_np=logits_indices_np,
         )
         input_batch_kwargs["has_prefill"] = batch_has_prefill
+        input_batch_kwargs["decode_graph_eligible"] = decode_graph_eligible
+        input_batch_kwargs["prefill_runs_as_decode_np"] = prefill_runs_as_decode_np
         input_batch = Ascend310PInputBatch(**input_batch_kwargs)
         # MRoPE positions are built in ``model_state.prepare_inputs``; the 1D
         # arange buffer above is only for slot-mapping / non-MRoPE paths.
@@ -537,7 +563,45 @@ class NPUModelRunner310V2(NPUModelRunner):
         )
         from vllm_ascend.attention.attention_v1 import AscendAttentionState
 
+        # After #17461, uniform MTP verify is ChunkedPrefill in shared helpers.
+        # Without promotion this gate forced CUDAGraphMode.NONE every decode
+        # step and erased the #17278 FULL-replay gains on small 310P models.
+        attn_state = self._promote_mtp_spec_decoding_attn_state(
+            attn_state,
+            num_reqs=num_reqs,
+            num_scheduled_tokens=num_scheduled,
+            num_valid_tokens=num_valid_tokens,
+        )
         return attn_state != AscendAttentionState.SpecDecoding
+
+    def _promote_mtp_spec_decoding_attn_state(
+        self,
+        attn_state: Any,
+        *,
+        num_reqs: int,
+        num_scheduled_tokens: np.ndarray,
+        num_valid_tokens: np.ndarray,
+    ) -> Any:
+        """Map uniform MTP verify batches back to SpecDecoding on 310P.
+
+        Upstream #17461 intentionally uses ChunkedPrefill for MTP on 910-class
+        devices. 310P ACLGraph capture still tags SpecDecoding (splitfuse) via
+        ``ModelAclGraphManager310.make_dummy``; keep runtime/eager-gate aligned.
+        """
+        if self.speculative_config is None or num_reqs <= 0:
+            return attn_state
+        from vllm_ascend.attention.attention_v1 import AscendAttentionState
+
+        if attn_state not in (
+            AscendAttentionState.ChunkedPrefill,
+            AscendAttentionState.SpecDecoding,
+        ):
+            return attn_state
+        if not np.all(num_valid_tokens == 1):
+            return attn_state
+        if not np.all(num_scheduled_tokens == self.decode_query_len):
+            return attn_state
+        return AscendAttentionState.SpecDecoding
 
     def _install_pc_eager_cudagraph_dispatch(self) -> None:
         """Wrap ACLGraph dispatch so PrefillCacheHit cannot replay FULL mixed graphs."""
@@ -582,6 +646,7 @@ class NPUModelRunner310V2(NPUModelRunner):
         is_profile: bool = False,
         context_len: int = 0,
         valid_dummy_state_slots: bool = False,
+        randomize_inputs: bool = False,
     ):
         self._force_eager_pc_batch = False
         self._force_eager_spec_batch = False
@@ -597,6 +662,7 @@ class NPUModelRunner310V2(NPUModelRunner):
                 is_profile=is_profile,
                 context_len=context_len,
                 valid_dummy_state_slots=valid_dummy_state_slots,
+                randomize_inputs=randomize_inputs,
             )
         finally:
             self._force_eager_pc_batch = False
@@ -607,7 +673,10 @@ class NPUModelRunner310V2(NPUModelRunner):
         scheduler_output: SchedulerOutput,
         batch_req_state: BatchReqState,
         batch_desc: BatchExecutionDescriptor,
+        num_active_loras: int,  # noqa: ARG002
     ) -> Ascend310PInputBatch:
+        # vLLM #56456 added the trailing num_active_loras positional
+        # argument; the 310P path does not use it.
         del batch_req_state
         return self._prepare_inputs_310p(scheduler_output, batch_desc)
 
@@ -751,14 +820,15 @@ class NPUModelRunner310V2(NPUModelRunner):
         )
         initialize_mamba_ssu_backend(self.vllm_config.mamba_config, self.kv_cache_config)
 
+        # vLLM #60517 removed the `tensor_parallel_size` parameter on main.
         cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
             attn_cg_support.min_cg_support,
             attn_cg_support.min_cg_attn_backend,
             self.decode_query_len,
             use_v2_model_runner=True,
-            tensor_parallel_size=self.parallel_config.tensor_parallel_size,
             kv_cache_config=kv_cache_config,
             max_num_reqs=self.max_num_reqs,
+            **{},
         )
         self.cudagraph_manager = ModelAclGraphManager310(
             self.vllm_config,
@@ -827,10 +897,12 @@ class NPUModelRunner310V2(NPUModelRunner):
                 block_size
                 for block_size in backend.get_supported_kernel_block_sizes()
                 if block_size * max_head_size <= _ATTENTION_BLOCK_SIZE_LIMIT
+                and all(spec.block_size % block_size == 0 for spec in attention_specs)
             ]
             if not supported_sizes:
                 raise NotImplementedError(
-                    f"310P paged attention requires block_size * head_size <= {_ATTENTION_BLOCK_SIZE_LIMIT}."
+                    f"310P paged attention requires block_size * head_size <= {_ATTENTION_BLOCK_SIZE_LIMIT} "
+                    "and a kernel block size that divides every attention cache block size in the group."
                 )
             self.kernel_block_sizes[group_id] = supported_sizes[0]
 
@@ -1114,6 +1186,11 @@ class NPUModelRunner310V2(NPUModelRunner):
                 self.input_buffers.input_ids[:num_decode_reqs].copy_(
                     decode_tokens.to(self.input_buffers.input_ids.dtype)
                 )
+                # FULL decode graphs embed padded rows as well. Clear them
+                # after the partial copy: reused buffers may contain stale
+                # out-of-vocabulary IDs, and 310P slice writes can affect the
+                # adjacent tail element.
+                self.input_buffers.input_ids[num_decode_reqs:num_tokens_after_padding].zero_()
                 return
             self._decode_req_indices.np[:num_decode_reqs] = decode_req_indices
             self._decode_input_indices.np[:num_decode_reqs] = decode_input_indices
@@ -1220,6 +1297,24 @@ class NPUModelRunner310V2(NPUModelRunner):
             num_tokens_padded=input_batch.num_tokens_after_padding,
         )
         return block_tables, slot_mappings
+
+    def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:
+        super()._dummy_sampler_run(hidden_states)
+        if not self.ascend_config.multistream_overlap_shared_expert or self.parallel_config.tensor_parallel_size <= 1:
+            return
+        if not self.compilation_config.cudagraph_mode.has_full_cudagraphs():
+            return
+
+        # The maximum-batch sampler profile above does not initialize the
+        # small-message HCCL transport used by decode logits AllGather. Do so
+        # before FULL graphs consume the limited 310P Event resources. Include
+        # batch 1 even if graph sizes start at 2: logits are not graph-padded.
+        # The enclosing profile_run already synchronizes before graph capture.
+        profile_rows = hidden_states.shape[0]
+        warmup_sizes = {1, *(self.compilation_config.cudagraph_capture_sizes or [])}
+        for num_rows in sorted(warmup_sizes):
+            if 0 < num_rows < profile_rows:
+                self.model.compute_logits(hidden_states[:num_rows])
 
     def sample(
         self,

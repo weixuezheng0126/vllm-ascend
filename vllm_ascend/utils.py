@@ -68,6 +68,7 @@ _CURRENT_STREAM = None
 _GLOBAL_STREAM = None
 _SHARED_EXPERTS_CALCULATION_STREAM = None
 _CP_CHUNKEDPREFILL_COMM_STREAM = None
+_CP_DECODE_COMM_STREAM = None
 _ASCEND_CUSTOMOP_IS_REIGISTERED = False
 _DEFAULT_BUFFER_SIZE = 200
 _MIN_DP_BUFFER_SIZE = 50
@@ -84,6 +85,15 @@ _CUSTOM_OP_BASE_DIR = (
     os.path.dirname(__file__) if os.path.isabs(__file__) else os.path.abspath(os.path.dirname(__file__))
 )
 _IS_ROT_WEIGHT_USED = None
+
+
+def is_gqa_pcp_dcp_config(model_config: Any, parallel_config: Any) -> bool:
+    """Whether a GQA/MQA model enables both PCP and DCP."""
+    return (
+        parallel_config.decode_context_parallel_size > 1
+        and parallel_config.prefill_context_parallel_size > 1
+        and not model_config.use_mla
+    )
 
 
 def extract_dsv4_layer_index(config: Any, layer_name: str) -> int:
@@ -115,6 +125,30 @@ def get_dsv4_compress_ratio(config: Any, layer_idx: int) -> int:
     if compress_ratios is None or layer_idx >= len(compress_ratios):
         return 0
     return compress_ratios[layer_idx]
+
+
+def dsv4_skips_indexer_topk(config: Any, layer_idx: int, pp_start_layer: int | None = None) -> bool:
+    """Whether a main-model V4 layer reuses another Indexer's Top-K indices.
+
+    Each PP stage anchors its local cache at its first C4 layer. Later C4
+    layers keep the configured global reuse schedule.
+    """
+    if not getattr(config, "use_index_cache", False) or get_dsv4_compress_ratio(config, layer_idx) != 4:
+        return False
+    compress_ratios = getattr(config, "compress_ratios", None) or []
+    indexer_seq_idx = sum(ratio == 4 for ratio in compress_ratios[:layer_idx])
+    pattern = getattr(config, "index_topk_pattern", None)
+    if pattern is None:
+        freq = getattr(config, "index_topk_freq", 1)
+        skip_topk = max(indexer_seq_idx - 1, 0) % freq != 0
+    else:
+        assert pattern[0] == "F", "index_topk_pattern must start with 'F'"
+        skip_topk = indexer_seq_idx < len(pattern) and pattern[indexer_seq_idx] == "S"
+    if skip_topk and pp_start_layer is not None:
+        # C128 and dense stage-start layers cannot initialize this buffer.
+        # Override only the first local C4, not the rest of the reuse group.
+        return any(ratio == 4 for ratio in compress_ratios[pp_start_layer:layer_idx])
+    return skip_topk
 
 
 def is_deepseek_v41(hf_config: Any) -> bool:
@@ -183,6 +217,16 @@ def model_uses_sfa_sparse(model_config: Any | None) -> bool:
     )
 
 
+def should_reuse_topk(config: Any, layer_id: int) -> bool:
+    """Return whether a layer reuses Top-K indices computed earlier."""
+    index_topk_pattern = getattr(config, "index_topk_pattern", None)
+    if index_topk_pattern is None:
+        index_topk_freq = getattr(config, "index_topk_freq", 1)
+        index_skip_topk_offset = getattr(config, "index_skip_topk_offset", 2)
+        return max(layer_id - index_skip_topk_offset + 1, 0) % index_topk_freq != 0
+    return 0 <= layer_id < len(index_topk_pattern) and index_topk_pattern[layer_id] == "S"
+
+
 def enable_sfa_dcp_replicated_indexer(vllm_config: VllmConfig | None = None) -> bool:
     if vllm_config is None:
         from vllm.config import get_current_vllm_config
@@ -194,8 +238,6 @@ def enable_sfa_dcp_replicated_indexer(vllm_config: VllmConfig | None = None) -> 
 
 
 def clear_enable_sp():
-    enable_dsa_cp.cache_clear()
-    enable_dsa_cp_full_o_proj.cache_clear()
     enable_pcp_o_proj_weight_sharding.cache_clear()
     enable_pcp_embedding_lmhead_weight_sharding.cache_clear()
     _libc_getenv.cache_clear()
@@ -622,6 +664,13 @@ def cp_chunkedprefill_comm_stream() -> torch.npu.Stream:
     return _CP_CHUNKEDPREFILL_COMM_STREAM
 
 
+def cp_decode_comm_stream() -> torch.npu.Stream:
+    global _CP_DECODE_COMM_STREAM
+    if _CP_DECODE_COMM_STREAM is None:
+        _CP_DECODE_COMM_STREAM = torch_npu.npu.Stream()
+    return _CP_DECODE_COMM_STREAM
+
+
 def attention_calculation_stream() -> torch.npu.Stream:
     global _ATNN_CALCULATION_STREAM
     if _ATNN_CALCULATION_STREAM is None:
@@ -786,8 +835,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
     from vllm_ascend.ops.fused_moe.fused_moe import AscendMoERunner
     from vllm_ascend.ops.fused_moe.gate_linear import AscendGateLinear
     from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts
-    from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
-    from vllm_ascend.ops.layernorm import AscendFusedRMSNormGated, AscendGemmaRMSNorm, AscendRMSNorm, AscendRMSNormGated
+    from vllm_ascend.ops.layernorm import AscendGemmaRMSNorm, AscendRMSNorm, AscendRMSNormGated
     from vllm_ascend.ops.linear import (
         AscendColumnParallelLinear,
         AscendMergedColumnParallelLinear,
@@ -817,7 +865,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
     REGISTERED_ASCEND_OPS = {
         "QuickGELU": AscendQuickGELU,
         "SiluAndMul": AscendSiluAndMul,
-        "SiluAndMulClamp": AscendSiluAndMulWithClamp,
+        "SiluAndMulWithClamp": AscendSiluAndMulWithClamp,
         "RotaryEmbedding": AscendRotaryEmbedding,
         "Gemma4RotaryEmbedding": AscendGemma4RotaryEmbedding,
         "MRotaryEmbedding": AscendMRotaryEmbedding,
@@ -837,11 +885,9 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
         "MMEncoderAttention": AscendMMEncoderAttention,
         "ApplyRotaryEmb": AscendApplyRotaryEmb,
         "RMSNormGated": AscendRMSNormGated,
-        "FusedRMSNormGated": AscendFusedRMSNormGated,
         "Conv3dLayer": AscendConv3dLayer,
         "RelPosAttention": AscendRelPosAttention,
         "CustomQwen2Decoder": AscendCustomQwen2Decoder,
-        "GatedDeltaNetAttention": AscendGatedDeltaNetAttention,
         "BailingMoELinearAttention": AscendBailingMoELinearAttention,
         "MoERunner": AscendMoERunner,
         "RoutedExperts": AscendRoutedExperts,
@@ -894,6 +940,11 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
                 "RoutedExperts": AscendRoutedExperts310,
             }
         )
+    else:
+        from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
+
+        REGISTERED_ASCEND_OPS["GatedDeltaNetAttention"] = AscendGatedDeltaNetAttention
+
     for name, op_cls in REGISTERED_ASCEND_OPS.items():
         CustomOp.register_oot(_decorated_op_cls=op_cls, name=name)
 
@@ -901,20 +952,59 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
     _ASCEND_CUSTOMOP_IS_REIGISTERED = True
 
 
+def register_ascend_fla_customop():
+    """Resolve the FLA subclass after selecting a device, before model loading.
+
+    Registration happens once inside the imported module, under Python's
+    module import lock. Repeated calls keep the same class and registry key.
+    """
+    # Separate this from general registration to avoid FLA initializing an NPU
+    # context during plugin discovery in the API process.
+    # TODO: Merge back into register_ascend_customop once supported vLLM FLA or
+    # Triton Ascend versions fix import-time NPU initialization.
+    from vllm_ascend.ops.fused_rms_norm_gated import AscendFusedRMSNormGated
+
+    REGISTERED_ASCEND_OPS["FusedRMSNormGated"] = AscendFusedRMSNormGated
+    return AscendFusedRMSNormGated
+
+
 def lmhead_tp_enable() -> bool:
-    return get_ascend_config().finegrained_tp_config.lmhead_tensor_parallel_size > 0
+    return get_ascend_config().finegrained_tp_config.lmhead_tensor_parallel_size > 1
+
+
+def lmhead_tp_max_num_logits(max_num_reqs: int, logits_rows_per_req: int) -> int:
+    """Row capacity every rank of the lmhead-TP group must agree on;
+    cross-rank drift desyncs the collectives and hangs."""
+    return max_num_reqs * logits_rows_per_req
+
+
+def lmhead_tp_pad_rows(rows: torch.Tensor, capacity: int, formula: str) -> torch.Tensor:
+    """Zero-pad the leading dim of ``rows`` up to ``capacity`` — the one pad
+    primitive both head paths share; for 1-D indices the zero padding is the
+    safe row-0 gather index, overrun fails fast with ``formula`` named."""
+    num_rows = rows.shape[0]
+    if num_rows > capacity:
+        raise ValueError(
+            f"lmhead TP rows ({num_rows}) exceed the group-agreed capacity "
+            f"({capacity} = {formula}); the capacity formula no longer matches "
+            "upstream logits production."
+        )
+    if num_rows == capacity:
+        return rows
+    padding = (0, 0, 0, capacity - num_rows) if rows.dim() == 2 else (0, capacity - num_rows)
+    return torch.nn.functional.pad(rows, padding)
 
 
 def embedding_tp_enable() -> bool:
-    return get_ascend_config().finegrained_tp_config.embedding_tensor_parallel_size > 0
+    return get_ascend_config().finegrained_tp_config.embedding_tensor_parallel_size > 1
 
 
 def oproj_tp_enable() -> bool:
-    return get_ascend_config().finegrained_tp_config.oproj_tensor_parallel_size > 0
+    return get_ascend_config().finegrained_tp_config.oproj_tensor_parallel_size > 1
 
 
 def mlp_tp_enable() -> bool:
-    return get_ascend_config().finegrained_tp_config.mlp_tensor_parallel_size > 0
+    return get_ascend_config().finegrained_tp_config.mlp_tensor_parallel_size > 1
 
 
 def enable_sp(vllm_config=None) -> bool:
@@ -930,6 +1020,20 @@ def enable_sp(vllm_config=None) -> bool:
         return False
 
     return bool(vllm_config.parallel_config.use_sequence_parallel_moe)
+
+
+def pad_sequence_parallel_tokens(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Pad the token dim of ``hidden_states`` up to the TP size.
+
+    Always call pad(), even with zero padding, to avoid specializing the
+    padding branch during tracing.
+    """
+    from vllm.distributed import get_tensor_model_parallel_world_size
+
+    tp_size = get_tensor_model_parallel_world_size()
+    padding = (-hidden_states.shape[0]) % tp_size
+    pad = (0, 0) * (hidden_states.ndim - 1) + (0, padding)
+    return torch.nn.functional.pad(hidden_states, pad)
 
 
 # TODO remove it after vllm has this func
@@ -1290,6 +1394,23 @@ def has_layer_idx(model_instance: torch.nn.Module) -> bool:
     return hasattr(model_instance, "model") and hasattr(model_instance.model, "start_layer")
 
 
+# C8_MXFP (FP8 KV + E8M0 scales) on Ascend A5 uses 512-token kernel blocks for
+# the QFA path (the QFA D=256 requirement doc allows block sizes 512/1024).
+A5_C8_MXFP_KV_CACHE_BLOCK_SIZE = 512
+
+# Enabled with ``--kv-cache-dtype mxfp8``, like the other Ascend C8 KV cache
+# flavors. The ModelSlim checkpoint recipe (fa_v.scale weights) is loaded when
+# present; it is not the switch.
+C8_MXFP_KV_CACHE_DTYPE = "mxfp8"
+
+
+def is_c8_mxfp_kv_quant(vllm_config: VllmConfig) -> bool:
+    # Tolerate partially constructed configs (e.g. SimpleNamespace in tests):
+    # a missing cache_config means the mxfp8 KV cache dtype is not enabled.
+    cache_config = getattr(vllm_config, "cache_config", None)
+    return cache_config is not None and cache_config.cache_dtype == C8_MXFP_KV_CACHE_DTYPE
+
+
 def refresh_block_size(vllm_config):
     """
     Refresh the block size in cache config.
@@ -1315,13 +1436,23 @@ def refresh_block_size(vllm_config):
     if cache_config.block_size is None:
         cache_config.block_size = 128
 
+    # Hybrid page padding is handled by the upstream cache planner. C8 only
+    # constrains the scheduler block to contain whole 512-token kernel blocks.
+    if is_c8_mxfp_kv_quant(vllm_config):
+        kernel_size = A5_C8_MXFP_KV_CACHE_BLOCK_SIZE
+        if cache_config.block_size % kernel_size:
+            if getattr(cache_config, "user_specified_block_size", False):
+                raise ValueError(f"C8_MXFP requires --block-size to be a multiple of {kernel_size}.")
+            cache_config.block_size = kernel_size
+        return
+
     if not scheduler_config or not model_config:
         return
 
     if model_config.hf_config.model_type == "deepseek_v4":
-        if cache_config.block_size is None:
-            cache_config.block_size = 32
-        elif cache_config.block_size not in [32, 64, 128]:
+        # CacheConfig resolves an omitted --block-size on its own default above, so
+        # block_size cannot be None here.
+        if cache_config.block_size not in [32, 64, 128]:
             logger.warning(
                 "For deepseek_v4 model, block size should be 32, 64 or 128. "
                 "Setting block size to 32 for better performance."
@@ -1463,20 +1594,9 @@ def singleton(cls):
     return get_instance
 
 
-@lru_cache(maxsize=1)
-def enable_dsa_cp() -> bool:
-    # Read from the validated AscendConfig singleton instead of bypassing it
-    # via additional_config["enable_dsa_cp"]. This converges the bypass read
-    # (architecture debt #7) onto the canonical get_ascend_config() path, so
-    # the value benefits from @config type validation (bool lax coercion).
-    from vllm_ascend.ascend_config import get_ascend_config
-
-    return get_ascend_config().enable_dsa_cp
-
-
 def enable_sfa_dcp_force_tmajor_restore() -> bool:
     # Read from the validated AscendConfig singleton (additional-config key
-    # sfa_dcp_force_tmajor_restore), like enable_dsa_cp, so the value
+    # sfa_dcp_force_tmajor_restore), so the value
     # benefits from @config type validation (bool lax coercion).
     from vllm_ascend.ascend_config import get_ascend_config
 
@@ -1485,12 +1605,7 @@ def enable_sfa_dcp_force_tmajor_restore() -> bool:
 
 @lru_cache(maxsize=1)
 def enable_pcp_o_proj_weight_sharding() -> bool:
-    """Whether SFA-PCP stores O-proj weights as PCP-local resident shards.
-
-    This is a load-time option because it changes the physical parameter shape
-    from a TP-local shard to a TP×PCP-local shard. DSA-CP does not use this
-    user-controlled option.
-    """
+    """Whether PCP shards O-proj weights across its communication group."""
     from vllm_ascend.ascend_config import get_ascend_config
 
     return get_ascend_config().enable_pcp_o_proj_weight_sharding
@@ -1502,24 +1617,6 @@ def enable_pcp_embedding_lmhead_weight_sharding() -> bool:
     from vllm_ascend.ascend_config import get_ascend_config
 
     return get_ascend_config().enable_pcp_embedding_lmhead_weight_sharding
-
-
-@lru_cache(maxsize=1)
-def enable_dsa_cp_full_o_proj() -> bool:
-    """Whether this DSA-CP role uses the original full O-proj prefill path."""
-    if not enable_dsa_cp():
-        return False
-    from vllm.config import get_current_vllm_config
-
-    vllm_config = get_current_vllm_config()
-    kv_transfer_config = vllm_config.kv_transfer_config
-
-    # Use the gathered full o_proj weight when:
-    # 1) KV pooling is disabled, or
-    # 2) KV pooling is enabled on a prefill producer (including kv_both).
-    # DSA-CP prefill produces a full-head attention output, so the runtime
-    # asynchronously gathers a temporary full o_proj weight for the forward.
-    return kv_transfer_config is None or kv_transfer_config.is_kv_producer
 
 
 def check_gdn_layer(vllm_config) -> bool:
@@ -1691,9 +1788,13 @@ def get_compressed_pos_and_indices(
 def kv_cache_spec_uses_sparse_sfa_c8(kv_cache_spec) -> bool:
     from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 
-    return isinstance(kv_cache_spec, AscendMLAAttentionSpec) and bool(
-        getattr(kv_cache_spec, "cache_sparse_sfa_c8", False)
-    )
+    return isinstance(kv_cache_spec, AscendMLAAttentionSpec) and bool(kv_cache_spec.cache_sparse_sfa_c8)
+
+
+def kv_cache_spec_uses_packed_sfa_main_cache(kv_cache_spec) -> bool:
+    from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+
+    return isinstance(kv_cache_spec, AscendMLAAttentionSpec) and bool(kv_cache_spec.uses_packed_sfa_main_cache)
 
 
 def is_hidden_state_cache_spec(spec) -> bool:
@@ -1734,13 +1835,12 @@ def is_rot_weight_used(vllm_config: VllmConfig = None):
 
 
 def enable_sfa(vllm_config) -> bool:
+    """Whether the model uses SFA for its main attention cache."""
     model_config = getattr(vllm_config, "model_config", None)
     if model_config is None:
         return False
     hf_text_config = getattr(model_config, "hf_text_config", None)
     if hf_text_config is None:
-        return False
-    if model_uses_kpool_indexer(model_config):
         return False
     return hasattr(hf_text_config, "index_topk") and not hasattr(hf_text_config, "compress_ratios")
 

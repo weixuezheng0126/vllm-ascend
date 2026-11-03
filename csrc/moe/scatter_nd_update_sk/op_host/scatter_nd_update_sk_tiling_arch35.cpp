@@ -246,13 +246,20 @@ ge::graphStatus ScatterNdUpdateSkTilingRegbase::HandleNonContiguousCase(const ge
     IsContiguous_ = 0; // 非连续内存
 
     // sk 场景 storage shape 已被 launcher 覆盖为 viewShape，无法从 GetStorageShape 取得
-    // 真实 storage 覆盖大小；由首轴 stride 推导：storageSize = stride0 * afterAxis
-    // （afterAxis 即 [rankSize_, shapeRank) 维度的乘积，此时与 updates 尾部维度一致）
+    // 真实 storage 覆盖大小；由真实 strides 推导最大平坦偏移：
+    //   maxOffset = Σ_{d<rankSize} (varDim_d - 1) * stride_d，尾部 [rankSize_, shapeRank)
+    //   连续段贡献 afterAxis。kernel 侧以 outputStorageShapeSize 为写入守卫上界，
+    //   必须覆盖"最后一行的行尾"，旧公式 stride0 * afterAxis 把首轴 stride 当 dim 用，
+    //   当 var dim0 > afterAxis 时合法索引会被误拦（静默丢行）。
     int64_t afterAxis = 1;
     for (int64_t dim = static_cast<int64_t>(rankSize_); dim < shapeRank_; ++dim) {
         afterAxis *= varOriginShape.GetDim(dim);
     }
-    outputStorageShapeSize_ = static_cast<uint64_t>(attrStrides_[0]) * afterAxis;
+    int64_t maxOffset = 0;
+    for (int64_t dim = 0; dim < static_cast<int64_t>(rankSize_); ++dim) {
+        maxOffset += (varOriginShape.GetDim(dim) - 1) * attrStrides_[dim];
+    }
+    outputStorageShapeSize_ = static_cast<uint64_t>(maxOffset) + static_cast<uint64_t>(afterAxis);
 
     return ge::GRAPH_SUCCESS;
 }
@@ -323,16 +330,6 @@ ge::graphStatus ScatterNdUpdateSkTilingRegbase::CalculateDerivedParams(const ger
     }
     if (isDeterminstic_ != 1 && afterAxis_ * varTypeSize_ >= MIN_SIZE_SIMD_NONDETERMINSTIC) {
         isSimdNonDeterminstic_ = 1;
-    }
-
-    // SIMD 排序条件
-    // 1. indicesAxis_ > varInAxis_：索引数量大于原始索引数量，表示高重复度
-    // 2. 单核 indices 数量 > MIN_INDICES_PER_CORE_FOR_SIMD_SORT(64)：批次足够大
-    int64_t estimatedIndicesPerCore = SkCeilDiv(indicesAxis_, totalCoreNum_);
-    bool highDuplication = (indicesAxis_ > varInAxis_);
-    bool enoughBatchPerCore = (estimatedIndicesPerCore > MIN_INDICES_PER_CORE_FOR_SIMD_SORT);
-    if (isSimdNonDeterminstic_ == 1 && highDuplication && enoughBatchPerCore) {
-        isSimdWithSort_ = 1;
     }
 
     if (indicesAxis_ / varInAxis_ >= SIMT_SORT_LIMIT) {
@@ -924,6 +921,18 @@ void ScatterNdUpdateSkTilingRegbase::CalculateMask()
         isMask_ = 1;
     }
 }
+
+void ScatterNdUpdateSkTilingRegbase::UpdateSimdSortDecision()
+{
+    // GetPlatformInfo() has initialized and validated totalCoreNum_ at this stage.
+    int64_t estimatedIndicesPerCore = SkCeilDiv(indicesAxis_, totalCoreNum_);
+    bool highDuplication = (indicesAxis_ > varInAxis_);
+    bool enoughBatchPerCore = (estimatedIndicesPerCore > MIN_INDICES_PER_CORE_FOR_SIMD_SORT);
+    if (isSimdNonDeterminstic_ == 1 && highDuplication && enoughBatchPerCore) {
+        isSimdWithSort_ = 1;
+    }
+}
+
 ge::graphStatus ScatterNdUpdateSkTilingRegbase::DoOpTiling()
 {
     if (outputStorageShapeSize_ < INT32_MAX) {
@@ -933,6 +942,8 @@ ge::graphStatus ScatterNdUpdateSkTilingRegbase::DoOpTiling()
         outOfSetTypeSize_ = sizeof(int64_t);
         outOfSetDtype_ = ge::DataType::DT_INT64;
     }
+
+    UpdateSimdSortDecision();
 
     if (isSimdNonDeterminstic_ == 1) {
         CalculateMask();
