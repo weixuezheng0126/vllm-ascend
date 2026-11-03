@@ -7,6 +7,7 @@ import torch
 import torch_npu
 from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.distributed import get_tp_group
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
@@ -49,6 +50,18 @@ from vllm_ascend.utils import (
 # tuple (the scale slot exists only when LI C8 is enabled).
 INDEXER_K_CACHE_SLOT = 0
 INDEXER_SCALE_CACHE_SLOT = 1
+INDEXER_MIN_QUERY_ROWS_PER_RANK = 128
+
+
+def get_iqp_local_lengths(query_lengths, key_lengths, start, end):
+    """Preserve each TND segment's causal endpoint when slicing query rows."""
+    starts = torch.nn.functional.pad(query_lengths, (1, 0), value=0)[:-1]
+    local_start = starts.clamp(min=start)
+    local_end = query_lengths.clamp(max=end)
+    counts = local_end - local_start
+    local_queries = torch.cumsum(counts.clamp(min=0), dim=0).to(query_lengths.dtype)
+    local_keys = torch.where(counts > 0, (key_lengths - (query_lengths - local_end)).clamp(min=0), 0)
+    return local_queries, local_keys
 
 
 @dataclass
@@ -216,6 +229,14 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         # non-replicated token across the CP group. Base layout is a no-op.
         parallel_config = get_current_vllm_config().parallel_config
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
+        self._indexer_tp_size = parallel_config.tensor_parallel_size
+        self._indexer_query_parallel = (
+            get_ascend_config().enable_indexer_query_parallel
+            and model_type == "glm_moe_dsa"
+            and parallel_config.decode_context_parallel_size == 1
+            and self.enable_sparse_li_c8
+            and self.c8_k_cache_dtype == torch.float8_e4m3fn
+        )
         self._is_pcp_decode_sharded = is_pcp_decode_sharding_enabled(get_current_vllm_config())
         self._use_fused_cache_store = (
             type(self) is AscendSFAIndexerBackend
@@ -502,10 +523,37 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
             q_li_shape_ori = q_li.shape
             q_li, q_li_scale = self._quantize_li_tensor(q_li)
 
+        return self.select_topk(q_li, q_li_scale, q_li_shape_ori, weights, indexer_metadata)
+
+    def select_topk(self, q_li, q_li_scale, q_li_shape_ori, weights, indexer_metadata):
+        """Distribute long GLM query scoring while retaining the complete K cache."""
         topk_selector = getattr(indexer_metadata, "topk_selector", None)
         if topk_selector is not None:
             return topk_selector(q_li, weights, self, indexer_metadata, q_li_scale)
-        return DeviceOperator.indexer_select_post_process(
+        query_lengths = indexer_metadata.actual_seq_lengths_query
+        key_lengths = indexer_metadata.actual_seq_lengths_key
+        query_shape = q_li_shape_ori if q_li_shape_ori is not None else tuple(q_li.shape)
+        query_parallel = (
+            self._indexer_query_parallel
+            and not (self.use_pcp and indexer_metadata.num_decode_tokens > 0)
+            and self._indexer_tp_size > 1
+            and len(query_shape) == 3
+            and query_shape[0] == indexer_metadata.num_actual_tokens
+            and query_shape[0] >= self._indexer_tp_size * INDEXER_MIN_QUERY_ROWS_PER_RANK
+            and query_shape[0] % self._indexer_tp_size == 0
+        )
+        if query_parallel:
+            rows = query_shape[0] // self._indexer_tp_size
+            start = get_tp_group().rank_in_group * rows
+            end = start + rows
+            query_lengths, key_lengths = get_iqp_local_lengths(query_lengths, key_lengths, start, end)
+            q_li = q_li.view(query_shape)[start:end]
+            if q_li_scale is not None:
+                q_li_scale = q_li_scale.view(query_shape[:-1])[start:end]
+            weights = weights[start:end].contiguous()
+            if q_li_shape_ori is not None:
+                q_li_shape_ori = (rows, *query_shape[1:])
+        topk_indices = DeviceOperator.indexer_select_post_process(
             q_li,
             q_li_scale,
             q_li_shape_ori,
@@ -514,12 +562,15 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
             INDEXER_K_CACHE_SLOT,
             INDEXER_SCALE_CACHE_SLOT,
             indexer_metadata,
-            indexer_metadata.actual_seq_lengths_query,
-            indexer_metadata.actual_seq_lengths_key,
+            query_lengths,
+            key_lengths,
             self.enable_sparse_li_c8,
             self.enable_sparse_li_c4,
             self.use_torch_npu_lightning_indexer,
         )
+        if query_parallel:
+            topk_indices = get_tp_group().all_gather(topk_indices, dim=0)
+        return topk_indices
 
 
 class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerMetadata]):
