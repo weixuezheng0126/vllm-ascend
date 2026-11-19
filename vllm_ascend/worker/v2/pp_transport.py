@@ -270,6 +270,18 @@ def _get_transport_key_prefix(data_type: PPTransportDataType) -> str:
     return f"{_PP_TRANSPORT_PREFIX}_{data_type.value}_"
 
 
+def get_pp_topk_all_gather_overrides(rank_local: bool) -> dict[str, bool] | None:
+    """Keep DSA-CP's rank-local Top-K prefix on the matching PP/TP rank.
+
+    PP's slice/all-gather optimization requires replicated tensor contents.
+    Hidden states and residuals retain their existing transport policy.
+    """
+    if not rank_local:
+        return None
+    key = f"{_get_transport_key_prefix(PPTransportDataType.TOPK_INDICES)}0"
+    return {key: False}
+
+
 def get_pp_transport_tensors(
     intermediate_tensors: IntermediateTensors | None,
     data_type: PPTransportDataType,

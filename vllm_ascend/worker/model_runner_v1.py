@@ -248,6 +248,7 @@ from vllm_ascend.worker.utils import (
     row_major_strides,
 )
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
+from vllm_ascend.worker.v2.pp_transport import get_pp_topk_all_gather_overrides
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,
@@ -2638,7 +2639,11 @@ class NPUModelRunner(GPUModelRunner):
 
                 if not get_pp_group().is_last_rank:
                     sample_hidden_states = hidden_states[logits_indices]
-                    get_pp_group().send_tensor_dict(hidden_states.tensors, all_gather_group=get_tp_group())
+                    get_pp_group().send_tensor_dict(
+                        hidden_states.tensors,
+                        all_gather_group=get_tp_group(),
+                        all_gather_tensors=get_pp_topk_all_gather_overrides(enable_dsa_cp()),
+                    )
                     logits = None
                 else:
                     sample_hidden_states = hidden_states[logits_indices]

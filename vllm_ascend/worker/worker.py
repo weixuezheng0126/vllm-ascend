@@ -107,6 +107,7 @@ from vllm_ascend.utils import (
     setup_ascend_local_comm_res,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.v2.pp_transport import get_pp_topk_all_gather_overrides
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
@@ -786,6 +787,7 @@ class NPUWorker(WorkerBase):
             self._pp_send_work = []
 
         intermediate_tensors = None
+        topk_all_gather_overrides = get_pp_topk_all_gather_overrides(get_ascend_config().enable_dsa_cp)
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         if forward_pass and not get_pp_group().is_first_rank:
             if enable_sp():
@@ -793,7 +795,7 @@ class NPUWorker(WorkerBase):
             else:
                 all_gather_group = get_tp_group()
             tensor_dict, comm_handles, comm_postprocess = get_pp_group().irecv_tensor_dict(
-                all_gather_group=all_gather_group
+                all_gather_group=all_gather_group, all_gather_tensors=topk_all_gather_overrides
             )
             assert tensor_dict is not None
             intermediate_tensors = AsyncIntermediateTensors(
@@ -821,6 +823,7 @@ class NPUWorker(WorkerBase):
         self._pp_send_work = get_pp_group().isend_tensor_dict(
             output.tensors,
             all_gather_group=all_gather_group,
+            all_gather_tensors=topk_all_gather_overrides,
         )
 
         # Align with upstream GPUWorker: Model Runner V2 has no
