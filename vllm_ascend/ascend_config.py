@@ -424,6 +424,7 @@ class AscendConfig:
             "multistream_dsv4_dsa_overlap": true,
             "multistream_engram_overlap": true,
             "enable_prefill_mc2": false,
+            "moe_comm_method": "auto",
             "multistream_overlap_shared_expert": false,
             "enable_kv_nz": false,
             "enable_mc2_hierarchy_comm": false,
@@ -572,6 +573,10 @@ class AscendConfig:
         == DeviceAdaptorFamily.FP8_OPTIMIZED
     )
     enable_prefill_mc2: bool = False
+    # Explicit non-MC2 EP communication for topologies without UB Memory links.
+    # "auto" preserves hardware/token-based selection. Overrides also cover
+    # profile/warmup and decode, where small batches otherwise select MC2.
+    moe_comm_method: Literal["auto", "allgather", "alltoall"] = "auto"
     multistream_overlap_shared_expert: bool = False
     enable_kv_nz: bool = False
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
@@ -947,6 +952,10 @@ class AscendConfig:
         )
 
         self._validate_mc2_comm_alg(vc)
+        if self.moe_comm_method != "auto" and self.enable_fused_mc2:
+            raise ValueError("Explicit moe_comm_method requires enable_fused_mc2=0.")
+        if self.moe_comm_method == "allgather" and vc.lora_config is not None:
+            raise ValueError("MoE LoRA requires moe_comm_method='auto' or 'alltoall'.")
 
         # mega_moe_max_tokens range
         if self.mega_moe_max_tokens <= 0:

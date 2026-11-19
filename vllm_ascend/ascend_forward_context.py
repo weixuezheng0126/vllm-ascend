@@ -393,6 +393,7 @@ def select_moe_comm_method(
 
     mc2_tokens_capacity = get_mc2_tokens_capacity()
     moe_comm_policy = get_current_hardware_profile().moe_comm_policy
+    configured_method = get_ascend_config().moe_comm_method
     lora_config = getattr(vllm_config, "lora_config", None)
     if not vllm_config.parallel_config.enable_expert_parallel or get_ep_group().world_size == 1:
         moe_comm_type = MoECommType.ALLGATHER
@@ -401,6 +402,10 @@ def select_moe_comm_method(
         # Ascend MoE LoRA cannot patch FusedMC2 path for dispatch_ffn_combine/mega_moe
         # is a single fused C++ op. This covers both normal model
         # forward and _dummy_run during profile_run.
+        moe_comm_type = MoECommType.ALLTOALL
+    elif configured_method == "allgather":
+        moe_comm_type = MoECommType.ALLGATHER
+    elif configured_method == "alltoall":
         moe_comm_type = MoECommType.ALLTOALL
     elif moe_comm_policy is MoECommPolicy.ALLGATHER:
         moe_comm_type = MoECommType.ALLGATHER
